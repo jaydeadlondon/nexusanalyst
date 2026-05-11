@@ -1,5 +1,5 @@
 import os
-from typing import Annotated, TypedDict, Literal
+from typing import TypedDict
 from dotenv import load_dotenv
 
 from langchain_gigachat.chat_models import GigaChat
@@ -10,7 +10,6 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
 load_dotenv()
-
 embeddings = HuggingFaceEmbeddings(
     model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 )
@@ -27,80 +26,94 @@ class AgentState(TypedDict):
     pdf_context: str
     web_context: str
     final_answer: str
-    route: str
+    is_useful: str
 
 
 def router_node(state: AgentState):
-    """Решает: вопрос касается содержимого PDF или общей информации?"""
-    print("--- Роутер: Анализирую источник знаний... ---")
-    prompt = f"""Ты — диспетчер. Вопрс пользователя: {state['question']}
-    Определи, касается ли вопрос темы документов (аналитика, инструкции, отчеты) или это общий вопрос по миру/новостям.
-    Ответь одним словом: PDF или WEB."""
-
+    """Начальный выбор пути."""
+    print("--- 🤖 РОУТЕР: Выбираю начальный путь... ---")
+    prompt = f"Вопрос: {state['question']}\nКасается ли вопрос темы документов в PDF? Ответь только PDF или WEB."
     res = llm.invoke(prompt).content.strip().upper()
     route = "PDF" if "PDF" in res else "WEB"
-    return {"route": route}
+    return {"is_useful": route}
 
 
 def rag_node(state: AgentState):
-    """Ищет в документах."""
-    print("--- RAG: Поиск в локальной базе... ---")
+    """Поиск в PDF."""
+    print("--- 📄 RAG: Извлекаю данные из PDF... ---")
     docs = retriever.invoke(state["question"])
     context = "\n\n".join([d.page_content for d in docs])
     return {"pdf_context": context}
 
 
+def grade_documents_node(state: AgentState):
+    """Проверка качества найденных данных."""
+    print("--- ⚖️ ИНСПЕКТОР: Проверяю релевантность PDF... ---")
+
+    prompt = f"""Ты — инспектор качества. Твоя задача: оценить, содержат ли найденные документы ответ на вопрос.
+    ВОПРОС: {state['question']}
+    ДОКУМЕНТЫ: {state['pdf_context']}
+    
+    Если в документах есть хотя бы частичный ответ, напиши YES.
+    Если документы бесполезны для отве на этот вопрос, напиши NO.
+    Ответь ТОЛЬКО одним словом (YES или NO)."""
+
+    res = llm.invoke(prompt).content.strip().upper()
+    score = "YES" if "YES" in res else "NO"
+    return {"is_useful": score}
+
+
 def web_node(state: AgentState):
-    """Ищет в интернете."""
-    print("--- WEB: Поиск в сети... ---")
+    """Поиск в интернете (вызывается роутером или если инспектор сказал NO)."""
+    print("--- 🌐 WEB: Иду за данными в интернет... ---")
     results = web_search.run(state["question"])
     return {"web_context": results}
 
 
 def synthesis_node(state: AgentState):
-    """Объединяет всё и пишет финальный ответ."""
-    print("--- Синтез: Формирую ответ... ---")
-    pdf_data = state.get("pdf_context", "В документах ничего не найдено.")
-    web_data = state.get("web_context", "В интернете поиск не проводился.")
+    """Итоговый синтез."""
+    print("--- 📝 СИНТЕЗ: Формирую финальный отчет... ---")
+    context = f"PDF DATA: {state.get('pdf_context', '')}\nWEB DATA: {state.get('web_context', '')}"
 
-    prompt = f"""Ты — NexusAnalyst. Сформируй ответ на вопрос: {state['question']}
-    Используй эти данные из PDF: {pdf_data}
-    Используй эти данные из сети: {web_data}
-    Дай краткий и точный ответ на русском языке."""
-
+    prompt = f"Вопрос: {state['question']}\nДанные: {context}\nДай точный ответ."
     res = llm.invoke(prompt)
     return {"final_answer": res.content}
 
 
-builder = StateGraph(AgentState)
+workflow = StateGraph(AgentState)
 
-builder.add_node("router", router_node)
-builder.add_node("rag_node", rag_node)
-builder.add_node("web_node", web_node)
-builder.add_node("synthesis", synthesis_node)
+workflow.add_node("router", router_node)
+workflow.add_node("rag", rag_node)
+workflow.add_node("grader", grade_documents_node)
+workflow.add_node("web", web_node)
+workflow.add_node("synthesis", synthesis_node)
 
-builder.set_entry_point("router")
+workflow.set_entry_point("router")
 
-builder.add_conditional_edges(
-    "router", lambda x: x["route"], {"PDF": "rag_node", "WEB": "web_node"}
+workflow.add_conditional_edges(
+    "router", lambda x: x["is_useful"], {"PDF": "rag", "WEB": "web"}
 )
 
-builder.add_edge("rag_node", "synthesis")
-builder.add_edge("web_node", "synthesis")
-builder.add_edge("synthesis", END)
+workflow.add_edge("rag", "grader")
 
-memory = MemorySaver()
-app = builder.compile(checkpointer=memory)
+workflow.add_conditional_edges(
+    "grader", lambda x: x["is_useful"], {"YES": "synthesis", "NO": "web"}
+)
+
+workflow.add_edge("web", "synthesis")
+workflow.add_edge("synthesis", END)
+
+app = workflow.compile(checkpointer=MemorySaver())
 
 if __name__ == "__main__":
-    config = {"configurable": {"thread_id": "hybrid_1"}}
-
+    config = {"configurable": {"thread_id": "boss_level"}}
+    print("=== NexusAnalyst: Autonomous Mode ===")
     while True:
-        q = input("\nВаш вопрос: ")
+        q = input("\nВопрос: ")
         if q.lower() in ["exit", "quit"]:
             break
-
-        result = app.invoke(
-            {"question": q, "pdf_context": "", "web_context": ""}, config=config
+        res = app.invoke(
+            {"question": q, "pdf_context": "", "web_context": "", "is_useful": ""},
+            config=config,
         )
-        print(f"\n[NexusAnalyst]: {result['final_answer']}")
+        print(f"\n[NexusAnalyst]: {res['final_answer']}")
